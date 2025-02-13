@@ -283,11 +283,13 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_value_: Optional[Tuple[torch.Tensor]] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        # self.config.pretraining_tp: 1
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
@@ -316,10 +318,19 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        # kv_seq_len: current length
+
+        if past_key_value_ is not None:
+            # past_key_value: (k_tensor_cache, v_tensor_cache)
+            # past_key_value[0].shape: [bsz, self.num_heads, q_len, self.head_dim]
+            kv_seq_len += past_key_value_[0].shape[-2]
+
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # apply_rotary_pos_emb 不改变 query_states 和 key_states 的形状
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -329,10 +340,18 @@ class LlamaAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
 
         # repeat k/v heads if n_kv_heads < n_heads
+        # self.num_key_value_groups: 1
+        # 因此 repeat_kv 无事发生
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if past_key_value_ is not None:
+            attn_weights = torch.cat([
+                torch.matmul(query_states, past_key_value_[0].transpose(2, 3)),
+                torch.matmul(query_states, key_states.transpose(2, 3))
+            ], dim=-1) / math.sqrt(self.head_dim)
+        else:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -349,7 +368,12 @@ class LlamaAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if past_key_value_ is not None:
+            pre_len = past_key_value_[0].shape[-2]
+            attn_output = torch.matmul(attn_weights[:, :, :, :pre_len], past_key_value_[1]) + \
+                          torch.matmul(attn_weights[:, :, :, pre_len:], value_states)
+        else:
+            attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -387,6 +411,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_value_: Optional[Tuple[torch.Tensor]] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -414,6 +439,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_value_=past_key_value_,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -606,6 +632,7 @@ class LlamaModel(LlamaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_values_: Optional[List[torch.FloatTensor]] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -634,9 +661,13 @@ class LlamaModel(LlamaPreTrainedModel):
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
+        if past_key_values_ is not None:
+            past_key_values_length += past_key_values_[0][0].shape[2]
+
         if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
+            past_key_values_length += past_key_values[0][0].shape[2]
+
+        seq_length_with_past += past_key_values_length
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -676,6 +707,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            past_key_value_ = past_key_values_[idx] if past_key_values_ is not None else None
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
@@ -684,6 +716,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     def custom_forward(*inputs):
                         # None for past_key_value
                         return module(*inputs, past_key_value, output_attentions)
+                        # return module(*inputs, past_key_value_pre, past_key_value_cur, output_attentions)
 
                     return custom_forward
 
@@ -698,6 +731,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
+                    past_key_value_=past_key_value_,
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
@@ -765,6 +799,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_values_: Optional[List[torch.FloatTensor]] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -810,6 +845,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values_=past_key_values_,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
